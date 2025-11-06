@@ -1,0 +1,312 @@
+Name: macOS RDP via Tailscale (A)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:
+        description: "Tailscale tailnet (e.g. you@gmail.com)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key (device admin, no 'Bearer')"
+        required: true
+      ts_authkey:
+        description: "Tailscale auth key (reusable or ephemeral)"
+        required: true
+      gh_api_token:
+        description: "GitHub Personal Access Token (classic; scopes: repo, workflow)"
+        required: true
+      test_mode:
+        description: "Run 5-minute test loop"
+        type: boolean
+        default: false
+      runtime_minutes:
+        description: "Runtime in minutes (max 360; capped to 355)"
+        required: false
+        default: "355"
+      loops:
+        description: "How many handoffs (0 = infinite)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: tailscale-rdp-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash # Changed to bash for macOS
+
+env:
+  RDP_USER: Bullettemporary
+  RDP_PASS: Bullet@12345
+  TS_HOSTNAME: bullet
+  TS_CLI: /usr/local/bin/tailscale # Common path after install via Homebrew/pkg
+
+jobs:
+  rdp:
+    runs-on: macos-latest # Changed from windows-2022 to macos-latest
+    timeout-minutes: 370
+    steps:
+      - name: 🔧 Resolve inputs (safe)
+        id: cfg
+        env:
+          RAW_TAILNET:  ${{ inputs.ts_tailnet }}
+          RAW_APIKEY:   ${{ inputs.ts_api_key }}
+          RAW_AUTHKEY:  ${{ inputs.ts_authkey }}
+          RAW_PAT:      ${{ inputs.gh_api_token }}
+          RAW_TEST:     ${{ inputs.test_mode == true && 'true' || 'false' }}
+          RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
+          RAW_LOOPS:    ${{ inputs.loops || '0' }}
+        run: |
+          # PowerShell script translated to Bash
+          function to_int_or() { 
+              if [[ "$1" =~ ^[0-9]+$ ]]; then echo "$1"; else echo "$2"; fi 
+          }
+
+          tailnet="${RAW_TAILNET}"
+          apiKey="${RAW_APIKEY}"
+          authKey="${RAW_AUTHKEY}"
+          pat="${RAW_PAT}"
+          if [[ -z "$tailnet" || -z "$apiKey" || -z "$authKey" || -z "$pat" ]]; then
+              echo "Missing required inputs"
+              exit 1
+          fi
+
+          isTest=false
+          if [[ "$RAW_TEST" =~ ^(true|1|yes|on)$ ]]; then
+              isTest=true
+          fi
+
+          runtime=$(to_int_or "$RAW_RUNTIME" 355)
+          if [ "$isTest" = true ]; then runtime=5; fi
+
+          # Ensure ~6h (355) when test_mode is off and value is too small
+          if [ "$isTest" = false ] && [ "$runtime" -lt 6 ]; then runtime=355; fi
+          if [ "$runtime" -gt 360 ]; then runtime=355; fi
+
+          loops=$(to_int_or "$RAW_LOOPS" 0)
+          if [ "$loops" -lt 0 ]; then loops=0; fi
+
+          echo "tailnet=$tailnet" >> "$GITHUB_OUTPUT"
+          echo "apikey=$apiKey" >> "$GITHUB_OUTPUT"
+          echo "authkey=$authKey" >> "$GITHUB_OUTPUT"
+          echo "pat=$pat" >> "$GITHUB_OUTPUT"
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
+          echo "loops=$loops" >> "$GITHUB_OUTPUT"
+          echo "Resolved: test=$isTest, runtime=$runtime, loops=$loops"
+
+      - name: ⚙️ Install Tailscale (if missing) & show version
+        run: |
+          if [ ! -f "$TS_CLI" ]; then
+            # Use curl to download the Tailscale pkg installer
+            curl -o /tmp/tailscale.pkg https://pkgs.tailscale.com/stable/mac/Tailscale.pkg
+            # Install the package
+            sudo installer -pkg /tmp/tailscale.pkg -target /
+            # Wait for the service to start
+            sleep 5
+          fi
+          # Show version
+          sudo "$TS_CLI" version
+
+      - name: 🔐 Enable Screen Sharing user
+        run: |
+          USER_NAME="${{ env.RDP_USER }}"
+          USER_PASS="${{ env.RDP_PASS }}"
+
+          # Check if user exists. macOS user creation is more complex than Windows.
+          # We'll create a new user if it doesn't exist, which requires admin privileges (via sudo).
+          if ! id -u "$USER_NAME" > /dev/null 2>&1; then
+            # Create a user with a specific UID and home directory
+            # 501 is the standard first user, 502, 503, etc., are next. 
+            # We'll just pick a high number for a service account.
+            MAX_ID=$(dscl . list /Users UniqueID | awk '{print $2}' | sort -n | tail -1)
+            NEW_ID=$((MAX_ID + 1))
+            
+            sudo dscl . -create /Users/"$USER_NAME"
+            sudo dscl . -create /Users/"$USER_NAME" UserShell /bin/bash
+            sudo dscl . -create /Users/"$USER_NAME" RealName "Remote User"
+            sudo dscl . -create /Users/"$USER_NAME" UniqueID "$NEW_ID"
+            sudo dscl . -create /Users/"$USER_NAME" PrimaryGroupID 20 # 20 is 'staff'
+            sudo dscl . -create /Users/"$USER_NAME" NFSHomeDirectory /Users/"$USER_NAME"
+            sudo dscl . -passwd /Users/"$USER_NAME" "$USER_PASS"
+            sudo dscl . -append /Groups/admin GroupMembership "$USER_NAME" # Add to admin group
+          else
+            # User exists, just set the password and ensure they are an admin
+            sudo dscl . -passwd /Users/"$USER_NAME" "$USER_PASS"
+            sudo dscl . -append /Groups/admin GroupMembership "$USER_NAME"
+          fi
+
+          # Enable Screen Sharing (Remote Management)
+          # Allows control by all users for all devices (tailscale IP)
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -allowAccessFor -allUsers -privs -all -clientopts -setmenuextra -menuextra no
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent
+
+      - name: 🧹 PURGE any devices containing 'bullet' (startup)
+        run: |
+          # PowerShell script translated to Bash
+          match_device() {
+            local name="$1"
+            local hostname="$2"
+            local dnsname="$3"
+            if echo "$name $hostname $dnsname" | grep -iq "bullet"; then
+              return 0
+            else
+              return 1
+            fi
+          }
+          
+          hdr="Authorization: Bearer ${{ steps.cfg.outputs.apikey }}"
+          tn="${{ steps.cfg.outputs.tailnet }}"
+          
+          # Fetch all devices
+          devices_json=$(curl -s -H "$hdr" "https://api.tailscale.com/api/v2/tailnet/$tn/devices")
+          if [ $? -ne 0 ]; then
+              echo "Startup purge failed: Could not fetch devices"
+              exit 0
+          fi
+
+          # Use jq to iterate over devices
+          echo "$devices_json" | jq -c '.devices[]' | while read -r d; do
+              name=$(echo "$d" | jq -r '.name')
+              hostname=$(echo "$d" | jq -r '.hostname')
+              dnsname=$(echo "$d" | jq -r '.DNSName')
+              dev_id=$(echo "$d" | jq -r '.id')
+              
+              if match_device "$name" "$hostname" "$dnsname"; then
+                  echo "Attempting to delete device: $name (ID: $dev_id)"
+                  curl -s -X DELETE -H "$hdr" "https://api.tailscale.com/api/v2/device/$dev_id" > /dev/null
+                  if [ $? -eq 0 ]; then
+                      echo "Deleted at start: $name"
+                  else
+                      echo "Warning: Could not delete device $name"
+                  fi
+              fi
+          done
+
+      - name: 🔗 Tailscale up (hostname=bullet) + show IP/FQDN/DERP
+        id: up
+        run: |
+          # Use sudo to run the tailscale command as system service
+          sudo "$TS_CLI" logout > /dev/null 2>&1
+          sudo "$TS_CLI" up \
+            --authkey "${{ steps.cfg.outputs.authkey }}" \
+            --hostname "${{ env.TS_HOSTNAME }}" \
+            --accept-routes \
+            --accept-dns=false
+            
+          sleep 5
+
+          ip4=$(sudo "$TS_CLI" ip -4 | head -n 1)
+          status_json=$(sudo "$TS_CLI" status --json)
+          fqdn=$(echo "$status_json" | jq -r '.Self.DNSName')
+          derp=$(echo "$status_json" | jq -r '.Self.DERP')
+
+          echo "ip4=$ip4" >> "$GITHUB_OUTPUT"
+          echo "fqdn=$fqdn" >> "$GITHUB_OUTPUT"
+          echo "derp=$derp" >> "$GITHUB_OUTPUT"
+
+          # Use a different title for the step summary
+          echo "### Screen Sharing (A)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Host: ${{ env.TS_HOSTNAME }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "IPv4: $ip4" >> "$GITHUB_STEP_SUMMARY"
+          echo "MagicDNS: $fqdn" >> "$GITHUB_STEP_SUMMARY"
+          echo "DERP: $derp" >> "$GITHUB_STEP_SUMMARY"
+          echo "User: ${{ env.RDP_USER }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pass: ${{ env.RDP_PASS }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: ⏳ Keep alive
+        run: |
+          # PowerShell script translated to Bash
+          mins=${{ steps.cfg.outputs.runtime }}
+          end_timestamp=$(date -v +${mins}M +%s)
+          
+          while [ $(date +%s) -lt $end_timestamp ]; do
+            current_timestamp=$(date +%s)
+            time_left=$((end_timestamp - current_timestamp))
+            minutes_left=$(( (time_left + 59) / 60 )) # Ceiling division
+            
+            echo "Screen Sharing alive... ($minutes_left min left)"
+            sleep 60
+          done
+
+      - name: 🧹 PURGE any devices containing 'bullet' (exit)
+        if: always()
+        run: |
+          # Re-using the bash purge logic from startup
+          match_device() {
+            local name="$1"
+            local hostname="$2"
+            local dnsname="$3"
+            if echo "$name $hostname $dnsname" | grep -iq "bullet"; then
+              return 0
+            else
+              return 1
+            fi
+          }
+          
+          hdr="Authorization: Bearer ${{ steps.cfg.outputs.apikey }}"
+          tn="${{ steps.cfg.outputs.tailnet }}"
+          
+          # Fetch all devices
+          devices_json=$(curl -s -H "$hdr" "https://api.tailscale.com/api/v2/tailnet/$tn/devices")
+          if [ $? -ne 0 ]; then
+              echo "Exit purge failed: Could not fetch devices"
+              exit 0
+          fi
+
+          # Use jq to iterate over devices
+          echo "$devices_json" | jq -c '.devices[]' | while read -r d; do
+              name=$(echo "$d" | jq -r '.name')
+              hostname=$(echo "$d" | jq -r '.hostname')
+              dnsname=$(echo "$d" | jq -r '.DNSName')
+              dev_id=$(echo "$d" | jq -r '.id')
+              
+              if match_device "$name" "$hostname" "$dnsname"; then
+                  echo "Attempting to delete device: $name (ID: $dev_id)"
+                  curl -s -X DELETE -H "$hdr" "https://api.tailscale.com/api/v2/device/$dev_id" > /dev/null
+                  if [ $? -eq 0 ]; then
+                      echo "Deleted at exit: $name"
+                  else
+                      echo "Warning: Could not delete device $name"
+                  fi
+              fi
+          done
+
+      - name: 🔁 Dispatch workflow B (instant, forever by default)
+        if: always()
+        run: |
+          # PowerShell script translated to Bash
+          loops=${{ steps.cfg.outputs.loops }}
+          if [ "$loops" -eq 1 ]; then echo "Loops finished; not dispatching."; exit 0; fi
+          if [ "$loops" -gt 1 ]; then next=$((loops-1)); else next=0; fi
+
+          token="${{ steps.cfg.outputs.pat }}"
+          repo_url="https://api.github.com/repos/${{ github.repository }}/actions/workflows/macos-rdp-tailscale-B.yml/dispatches" # **CHECK FILENAME**
+
+          # Construct the JSON body
+          body=$(cat <<EOF
+{
+  "ref": "${{ github.ref_name }}",
+  "inputs": {
+    "ts_tailnet": "${{ steps.cfg.outputs.tailnet }}",
+    "ts_api_key": "${{ steps.cfg.outputs.apikey }}",
+    "ts_authkey": "${{ steps.cfg.outputs.authkey }}",
+    "gh_api_token": "$token",
+    "test_mode": "false",
+    "runtime_minutes": "${{ steps.cfg.outputs.runtime }}",
+    "loops": "$next"
+  }
+}
+EOF
+          )
+          
+          # Dispatch the workflow
+          curl -X POST "$repo_url" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -d "$body"
+
